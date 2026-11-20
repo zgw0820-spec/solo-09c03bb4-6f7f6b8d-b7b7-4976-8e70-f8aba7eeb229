@@ -55,6 +55,20 @@
   .kv { display: grid; grid-template-columns: 160px 1fr; gap: 3px 10px; font-size: 12.5px; }
   .kv span:nth-child(odd) { color: #8d9bad; }
   .empty { color: #66768a; padding: 8px 0; }
+  .alert { border-radius: 6px; padding: 8px 10px; margin-top: 10px; font-size: 12.5px; }
+  .alert.error { background: #331318; color: #ff9aa5; }
+  .alert.ok { background: #10331f; color: #6fe095; }
+  .alert.warn { background: #3b2f10; color: #ffd479; }
+  .link-box { background: #0b0f14; border-radius: 6px; padding: 8px 10px; margin-top: 8px; font-size: 12px; }
+  .link-box .url { word-break: break-all; color: #9fd0ff; }
+  .link-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 6px 0; border-bottom: 1px solid #202834; }
+  .link-row:last-child { border-bottom: 0; }
+  .link-row .grow { flex: 1; min-width: 200px; }
+  .link-row button { padding: 4px 9px; font-size: 12px; }
+  select { padding: 6px 8px; background: #0d1218; color: #d7dee8; border: 1px solid #2b3644; border-radius: 5px; min-width: 180px; }
+  .badge.open { background: #3b2f10; color: #ffd479; }
+  .badge.claimed { background: #10331f; color: #6fe095; }
+  .badge.revoked, .badge.expired { background: #331318; color: #ff8f9b; }
   @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -106,15 +120,24 @@
     </section>
   </div>
 
-  <section>
-    <h2>链路详情 <span class="muted" id="detail-id"></span></h2>
-    <div id="detail" class="empty">在左侧选择一条链路，或在地址栏加 ?trace=&lt;trace_id&gt; 直接查看。</div>
-  </section>
+  <div>
+    <section>
+      <h2>链路详情 <span class="muted" id="detail-id"></span></h2>
+      <div id="detail" class="empty">在左侧选择一条链路，或在地址栏加 ?trace=&lt;trace_id&gt; 直接查看。</div>
+    </section>
+
+    <section style="margin-top:18px">
+      <h2>协查链接 <span class="muted">（仅已留存链路）</span></h2>
+      <div id="incident">
+        <div class="empty">选择一条已留存的链路后，可针对其中一个服务生成协查链接。</div>
+      </div>
+    </section>
+  </div>
 </main>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { filter: "", selected: null, config: null, staged: null };
+const state = { filter: "", selected: null, config: null, staged: null, detail: null, incidentCfg: null };
 
 function fmtMs(ns) {
   return ns === null || ns === undefined ? "—" : (ns / 1e6).toFixed(2) + " ms";
@@ -135,6 +158,9 @@ async function loadConfig() {
   state.config = cfg;
   $("cfg").textContent =
     `窗口 ${cfg.window_seconds}s · 并发上限 ${cfg.max_active_traces} 条 · 慢根阈值 ${cfg.slow_root_ms}ms`;
+  try {
+    state.incidentCfg = await (await fetch("/api/incidents/config")).json();
+  } catch (e) { state.incidentCfg = { ttl_seconds: 900, public_base_url: "" }; }
 }
 
 async function refresh() {
@@ -174,6 +200,7 @@ async function selectTrace(traceId, quiet) {
   }
   renderDetail(await res.json());
   if (!quiet) refreshRowsSelection();
+  await renderIncidentPanel();
 }
 
 function refreshRowsSelection() {
@@ -183,6 +210,7 @@ function refreshRowsSelection() {
 }
 
 function renderDetail(t) {
+  state.detail = t;
   $("detail-id").textContent = t.trace_id;
   const badge = `<span class="badge ${t.state}">${t.state}</span>`;
   const reasons = [];
@@ -230,6 +258,117 @@ function renderWaterfall(spans) {
       </div>`;
     }).join("");
   return rows;
+}
+
+// ---------------------------------------------------------------------------
+// investigation links (duty operator side)
+// ---------------------------------------------------------------------------
+
+function serviceOptions(t) {
+  const spans = t.spans || [];
+  const services = [...new Set(spans.map((s) => s.service).filter(Boolean))];
+  return services;
+}
+
+async function renderIncidentPanel() {
+  const box = $("incident");
+  const t = state.detail;
+  if (!t) {
+    box.innerHTML = `<div class="empty">选择一条已留存的链路后，可针对其中一个服务生成协查链接。</div>`;
+    return;
+  }
+  if (t.state !== "kept") {
+    box.innerHTML = `<div class="empty">协查链接只对「已留存」的链路开放（当前：${esc(t.state)}）。</div>`;
+    return;
+  }
+  const services = serviceOptions(t);
+  if (!services.length) {
+    box.innerHTML = `<div class="empty">该链路没有可协查的服务。</div>`;
+    return;
+  }
+  if (!state.incidentService || !services.includes(state.incidentService)) {
+    state.incidentService = services[0];
+  }
+  const ttl = state.incidentCfg ? state.incidentCfg.ttl_seconds : 900;
+  box.innerHTML = `
+    <div class="muted" style="font-size:12px;margin-bottom:8px">
+      签发后 ${Math.round(ttl / 60)} 分钟内有效 · 单浏览器领取 · 仅展示所选服务的 span 名称、耗时、状态
+    </div>
+    <div class="link-row">
+      <select id="incident-service">
+        ${services.map((s) => `<option ${s === state.incidentService ? "selected" : ""}>${esc(s)}</option>`).join("")}
+      </select>
+      <button id="incident-create">生成协查链接</button>
+    </div>
+    <div id="incident-msg"></div>
+    <div id="incident-links"><span class="muted">加载已发放的链接…</span></div>`;
+  $("incident-service").onchange = (e) => { state.incidentService = e.target.value; };
+  $("incident-create").onclick = () => createIncidentLink(t.trace_id);
+  await loadIncidentLinks(t.trace_id);
+}
+
+async function createIncidentLink(traceId) {
+  const btn = $("incident-create");
+  if (btn) { btn.disabled = true; btn.textContent = "生成中…"; }
+  const service = $("incident-service").value;
+  const res = await fetch("/api/incidents/links", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trace_id: traceId, service }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    $("incident-msg").innerHTML = `<div class="alert error">${esc(data.error || "生成失败")}</div>`;
+    if (btn) { btn.disabled = false; btn.textContent = "生成协查链接"; }
+    return;
+  }
+  $("incident-msg").innerHTML =
+    `<div class="alert ok">已为服务 <b>${esc(data.service)}</b> 生成链接，有效期至 ${new Date(data.expires_at * 1000).toLocaleTimeString()}。</div>`;
+  await loadIncidentLinks(traceId);
+}
+
+async function loadIncidentLinks(traceId) {
+  const box = $("incident-links");
+  if (!box) return;
+  const res = await fetch("/api/incidents/links?trace_id=" + encodeURIComponent(traceId));
+  const data = await res.json();
+  const links = data.links || [];
+  if (!links.length) {
+    box.innerHTML = `<div class="empty">还没有为该链路生成协查链接。</div>`;
+    return;
+  }
+  box.innerHTML = links.map((l) => `
+    <div class="link-row">
+      <div class="grow">
+        <span class="badge ${l.status}">${l.status}</span>
+        <span class="mono">${esc(l.service)}</span>
+        <div class="url mono" style="margin-top:3px">${esc(l.url || (state.incidentCfg ? state.incidentCfg.public_base_url : "") + "/i/" + l.link_id)}</div>
+        <div class="muted">有效至 ${new Date(l.expires_at * 1000).toLocaleString()}${l.claimed_at ? " · 领取于 " + new Date(l.claimed_at * 1000).toLocaleTimeString() : ""}</div>
+      </div>
+      <button class="secondary" data-copy="${esc(l.link_id)}">复制</button>
+      ${l.status !== "revoked" && l.status !== "expired"
+        ? `<button class="secondary" data-revoke="${esc(l.link_id)}">撤回</button>` : ""}
+    </div>`).join("");
+  box.querySelectorAll("[data-copy]").forEach((b) => {
+    b.onclick = () => {
+      const link = links.find((x) => x.link_id === b.dataset.copy);
+      const url = link.url || (state.incidentCfg ? state.incidentCfg.public_base_url : "") + "/i/" + link.link_id;
+      navigator.clipboard?.writeText(url).then(
+        () => log("📋 已复制协查链接"),
+        () => log("复制失败，请手动选择链接文本"));
+    };
+  });
+  box.querySelectorAll("[data-revoke]").forEach((b) => {
+    b.onclick = () => revokeIncidentLink(traceId, b.dataset.revoke);
+  });
+}
+
+async function revokeIncidentLink(traceId, linkId) {
+  if (!confirm("撤回后，即使已领取的浏览器也无法再次取数。确定撤回？")) return;
+  const res = await fetch(`/api/incidents/links/${encodeURIComponent(linkId)}/revoke`, { method: "POST" });
+  const data = await res.json();
+  if (!res.ok) { log(`❌ 撤回失败：${data.error || res.status}`); return; }
+  log("🛑 已撤回协查链接");
+  await loadIncidentLinks(traceId);
 }
 
 async function simulate(part) {

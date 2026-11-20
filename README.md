@@ -8,18 +8,25 @@
 
 ```bash
 docker compose up --build
-# 打开 http://localhost:8000
+# 值班页  http://localhost:8000
+# 协查页  http://localhost:8080  （仅领取与查看）
 ```
 
 状态保存在命名卷 `collector-data` 中的 SQLite 文件里；`docker compose restart`
-后沿用原截止时间，不会重新计时。
+后沿用原截止时间、协查链接有效期、领取与撤回状态，不会重新计时。
+
+Compose 里两个服务共用同一数据卷但只发布各自的页面：`collector` 绑定
+`127.0.0.1:8000`（OTLP 接收与内网巡检接口，不对外），`incident` 发布 `8080`
+（协查入口，只有领取页和查看接口）。协查进程是独立 FastAPI 应用，不导入也不挂载
+采集器任何路由。
 
 本地（无 Docker）运行：
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --port 8000
+uvicorn app.main:app --port 8000          # 值班页 + OTLP
+uvicorn app.incident_app:app --port 8080  # 协查页
 ```
 
 ## 规则（实现语义）
@@ -51,6 +58,39 @@ uvicorn app.main:app --port 8000
 - `GET /api/config`、`GET /api/stats`、`GET /healthz`。
 - 网页：`GET /`；`/?trace=<id>` 可直接打开某条链。
 
+### 协查链接（值班侧，内网）
+
+- `POST /api/incidents/links` `{"trace_id": ..., "service": ...}` — 为**已留存**
+  链路中的某个服务签发链接，返回 `link_id`、`expires_at` 和公网 `url`。
+- `GET /api/incidents/links?trace_id=...` — 该链路的链接及状态
+  （`open` / `claimed` / `revoked` / `expired`）。
+- `POST /api/incidents/links/{link_id}/revoke` — 撤回。
+- `GET /api/incidents/config` — 有效期与公网基址。
+
+### 协查页（公网独立端口，仅此三条）
+
+- `GET /i/{link_id}` — 领取页（先展示领取页，不展示链路数据）。
+- `POST /i/{link_id}/claim` `{"nonce": "..."}` — 领取；并发时只有一个成功。
+  令牌写入 `HttpOnly` Cookie，服务端只存哈希。
+- `GET /i/{link_id}/view` — 已领取浏览器反复查看所选服务的 span
+  **名称、耗时、状态**；不含 span id、属性、原始 OTLP 或其他服务。
+- `GET /i/{link_id}/state`、`GET /healthz`。
+
+协查页的 `/v1/traces`、`/api/traces`、`/api/stats` 等采集器接口一律 404。
+
+### 协查语义
+
+| 要求 | 实现 |
+| --- | --- |
+| 仅已留存链路、单个服务 | 建链时校验 `state=kept` 且服务确有留存 span |
+| 签发后 15 分钟内有效 | `expires_at = created_at + INCIDENT_TTL_SECONDS`，固定不改 |
+| 打开先显示领取页 | `/i/{id}` 只返回领取页；未领取时 `/state` 不返回 trace_id |
+| 只有领取成功的浏览器能查看 | `/view` 校验 Cookie 中的令牌；其他浏览器 401/403 |
+| 两个浏览器同时领取只成功一个 | `BEGIN IMMEDIATE` + `UPDATE ... WHERE claimed_at IS NULL` |
+| 响应丢失后原浏览器重试仍可查看 | 令牌由 DB 内签名密钥 + 客户端 nonce 派生；同 nonce 重试幂等 |
+| 撤回/到期后已领取也不能再取数 | 每次 `/view` 重新校验状态与有效期 |
+| 重启保持有效期/领取/撤回 | 全部状态在 SQLite；签名密钥也在库里 |
+
 ### 模拟上报
 
 `POST /api/simulate`，body 例：
@@ -73,6 +113,8 @@ uvicorn app.main:app --port 8000
 | `MAX_ACTIVE_TRACES` | `8` | 同时收集的链上限 |
 | `SLOW_ROOT_MS` | `500` | 慢根阈值（严格大于） |
 | `SWEEP_INTERVAL_MS` | `50` | 后台结算间隔 |
+| `INCIDENT_TTL_SECONDS` | `900` | 协查链接有效期（签发后固定 15 分钟） |
+| `INCIDENT_PUBLIC_BASE_URL` | `http://localhost:8080` | 值班页生成协查链接时使用的公网基址 |
 
 ## 已知限制
 
@@ -80,12 +122,18 @@ uvicorn app.main:app --port 8000
   默认 protobuf 的 exporter，需要设置 `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`。
 - 以单进程（单 worker）部署为前提：容量计数与判定靠进程内锁 + `BEGIN IMMEDIATE`
   串行化，多 worker 会各自计容量（SQLite 本身仍一致）。
+- 两个 Compose 服务各起一个进程、共享一个 SQLite 文件；写操作靠
+  `BEGIN IMMEDIATE` 和 WAL 串行化，因此双方都按单 worker 运行。
 - 慢根判定基于上报的根 span 自身耗时；若根 span 始终未上报，则只看是否有报错 span。
 - 重复 span 按 span_id 去重，保留首次上报的内容。
+- 协查链接的「仅一个浏览器可领取」以浏览器 Cookie 为准：同一台机器上的不同浏览器
+  算不同领取者；清除 Cookie 后原浏览器会失去查看权（链接本身仍绑定首个领取者）。
+- 领取令牌是针对链接与客户端 nonce 的 HMAC；nonce 由浏览器生成并保存在
+  `localStorage`，用于响应丢失后的幂等重试，不会随链接泄露给他人。
 
 ## 测试
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests -q      # 19 个用例，注入时钟覆盖窗口/容量/重启等场景
+python -m pytest tests -q      # 32 个用例，注入时钟覆盖窗口/容量/重启与协查场景
 ```

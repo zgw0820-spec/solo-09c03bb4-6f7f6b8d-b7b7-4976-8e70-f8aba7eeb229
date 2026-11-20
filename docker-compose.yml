@@ -1,20 +1,56 @@
 services:
+  # Internal duty console: OTLP intake + trace inspection + link management.
+  # Published on 8000 for operators; ingestion routes stay here and nowhere
+  # else.  In a real deployment do not expose 8000 to the internet.
   collector:
     build: .
     image: otlp-tail-sampler:local
     container_name: otlp-tail-sampler
     ports:
-      - "8000:8000"
+      # Bind to loopback only: OTLP intake and the collector's inspection API
+      # stay on the internal network, never on the public interface.
+      - "127.0.0.1:8000:8000"
     environment:
       DB_PATH: /data/collector.db
       COLLECT_WINDOW_SECONDS: "5"
       MAX_ACTIVE_TRACES: "8"
       SLOW_ROOT_MS: "500"
       SWEEP_INTERVAL_MS: "50"
+      INCIDENT_TTL_SECONDS: "900"
+      INCIDENT_PUBLIC_BASE_URL: "http://localhost:8080"
     volumes:
-      # Named volume keeps collection state (and deadlines) across restarts.
+      # Named volume keeps collection state, links (deadlines/claims/revokes)
+      # across restarts.
       - collector-data:/data
     restart: unless-stopped
+
+  # Public investigation viewer on its own port.  Only the claim page, claim
+  # endpoint and service-scoped view endpoint; it shares the data volume but
+  # never mounts the collector's ingestion or inspection routes.
+  incident:
+    build: .
+    image: otlp-tail-sampler:local
+    container_name: otlp-incident-viewer
+    command:
+      ["uvicorn", "app.incident_app:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+    ports:
+      # The only publicly reachable surface: claim page + claimed view.
+      - "8080:8080"
+    environment:
+      DB_PATH: /data/collector.db
+      INCIDENT_TTL_SECONDS: "900"
+      INCIDENT_PUBLIC_BASE_URL: "http://localhost:8080"
+    volumes:
+      - collector-data:/data
+    depends_on:
+      - collector
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
 
 volumes:
   collector-data:

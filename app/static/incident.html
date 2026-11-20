@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>协查 · 故障链路</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; justify-content: center;
+    padding: 40px 18px; font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #10151c; color: #d7dee8;
+  }
+  .card { width: 100%; max-width: 720px; background: #151b24; border: 1px solid #232c38; border-radius: 10px; padding: 22px 24px; align-self: flex-start; }
+  h1 { font-size: 17px; margin: 0 0 4px; color: #9fd0ff; }
+  h2 { font-size: 14px; margin: 18px 0 8px; color: #9fd0ff; }
+  .muted { color: #7d8b9c; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 12px; font-size: 13px; margin: 14px 0; }
+  .kv span:nth-child(odd) { color: #8d9bad; }
+  .mono { word-break: break-all; }
+  button { padding: 8px 14px; background: #1d4ed8; color: #fff; border: 0; border-radius: 6px; cursor: pointer; font: inherit; }
+  button.secondary { background: #2a3646; }
+  button:disabled { opacity: .5; cursor: default; }
+  .buttons { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .note { background: #0b0f14; border-radius: 6px; padding: 10px 12px; margin-top: 14px; font-size: 12.5px; color: #9aa8b9; }
+  .alert { border-radius: 6px; padding: 10px 12px; margin-top: 14px; font-size: 13px; }
+  .alert.error { background: #331318; color: #ff9aa5; }
+  .alert.ok { background: #10331f; color: #6fe095; }
+  .alert.warn { background: #3b2f10; color: #ffd479; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #202834; }
+  th { color: #8d9bad; font-weight: 500; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; }
+  .badge.ok { background: #1b2836; color: #8fb6d9; }
+  .badge.err { background: #3a1117; color: #ff9aa5; }
+  .hidden { display: none; }
+  .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid #4a5a6e; border-top-color: #9fd0ff; border-radius: 50%; animation: sp 1s linear infinite; vertical-align: -2px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="card" id="app">
+  <h1>协查 · 故障链路</h1>
+  <div class="muted" id="subtitle">正在加载…</div>
+  <div id="content"><span class="spin"></span> <span class="muted">加载中…</span></div>
+</div>
+
+<script>
+const linkId = decodeURIComponent(location.pathname.split("/")[2] || "");
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const NONCE_KEY = "incident_nonce_" + linkId;
+
+let pollTimer = null;
+
+function fmtTime(ts) {
+  return ts ? new Date(ts * 1000).toLocaleString() : "—";
+}
+function fmtMs(v) {
+  return v === null || v === undefined ? "—" : v.toFixed(2) + " ms";
+}
+function setHtml(html) { $("content").innerHTML = html; }
+function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+// A per-link nonce persisted before the claim request.  Reusing it after a
+// lost response lets the same browser recover the same claim.
+function getNonce() {
+  let nonce = localStorage.getItem(NONCE_KEY);
+  if (!nonce) {
+    nonce = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)) +
+            crypto.getRandomValues(new Uint32Array(2)).join("");
+    localStorage.setItem(NONCE_KEY, nonce);
+  }
+  return nonce;
+}
+
+async function readJson(res) {
+  try { return await res.json(); } catch (e) { return {}; }
+}
+
+function errorPage(title, detail) {
+  stopPolling();
+  $("subtitle").textContent = "无法继续查看";
+  setHtml(`
+    <div class="alert error"><b>${esc(title)}</b><br>${esc(detail || "")}</div>
+    <div class="note">如仍需要该服务的链路信息，请联系值班员重新生成协查链接。</div>`);
+}
+
+async function loadState() {
+  const res = await fetch(`/i/${encodeURIComponent(linkId)}/state`, { cache: "no-store" });
+  const data = await readJson(res);
+  if (res.status === 404) return errorPage("链接不存在", "该协查链接无效。");
+  if (!res.ok) return errorPage("读取链接失败", data.error);
+
+  $("subtitle").textContent = `链接 ${linkId.slice(0, 10)}…`;
+
+  if (data.status === "revoked") return errorPage("链接已撤回", "值班员已撤回此协查链接。");
+  if (data.status === "expired") return errorPage("链接已过期", "此协查链接已超过有效期。");
+
+  if (data.claimed_by_this_browser) return showViewer(data);
+  if (data.status === "claimed") {
+    // The link is claimed but this browser has no valid claim cookie.  If it
+    // has a stored nonce it may be the original claimant whose response was
+    // lost, so retry the (idempotent) claim before declaring it taken.
+    if (localStorage.getItem(NONCE_KEY)) {
+      const outcome = await performClaim();
+      if (outcome === "claimed") return loadState();
+      if (outcome === "unreachable") {
+        return errorPage(
+          "领取结果未知",
+          "此链接已被领取，但无法确认是否为本浏览器。请重新打开链接，或将本页面留在原浏览器中重试。"
+        );
+      }
+    }
+    return errorPage("已被其他浏览器领取", "该协查链接已被领取，只有领取成功的浏览器可以查看。");
+  }
+  return showClaimPage(data);
+}
+
+function showClaimPage(data) {
+  stopPolling();
+  const storedNonce = localStorage.getItem(NONCE_KEY);
+  setHtml(`
+    <div class="kv">
+      <span>协查服务</span><span class="mono">${esc(data.service)}</span>
+      <span>链接状态</span><span><span class="badge ok">待领取</span></span>
+      <span>有效至</span><span>${fmtTime(data.expires_at)}</span>
+    </div>
+    <div class="note">
+      本链接<strong>只能由一个浏览器领取</strong>。确认领取后，本浏览器可在有效期内反复查看该服务的
+      span 名称、耗时与状态；其他服务的链路数据不在本页面范围内。
+    </div>
+    <div id="claim-msg"></div>
+    <div class="buttons">
+      <button id="claim-btn">确认领取</button>
+      <button class="secondary" id="refresh-btn">刷新状态</button>
+    </div>
+    ${storedNonce ? '<div class="note">检测到本浏览器曾尝试领取。若领取时网络中断，点「确认领取」将以同一凭证重试。</div>' : ""}
+  `);
+  $("claim-btn").onclick = () => doClaim();
+  $("refresh-btn").onclick = () => loadState();
+}
+
+async function doClaim() {
+  const btn = $("claim-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "领取中…"; }
+  const outcome = await performClaim();
+  if (outcome === "claimed") return loadState();
+  if (outcome === "unreachable") {
+    if (btn) { btn.disabled = false; btn.textContent = "确认领取（重试）"; }
+    const box = $("claim-msg");
+    if (box) box.innerHTML = `<div class="alert warn">网络中断，未收到服务器响应。请点击「确认领取」重试（不会重复占用）。</div>`;
+    return;
+  }
+  // "rejected": the UI (if any) was already updated by performClaim.
+}
+
+// Returns "claimed" | "rejected" | "unreachable".  Reusing the stored nonce
+// makes a retry after a lost response recover the same claim.
+async function performClaim() {
+  const nonce = getNonce();
+  let res;
+  try {
+    res = await fetch(`/i/${encodeURIComponent(linkId)}/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ nonce }),
+      cache: "no-store",
+    });
+  } catch (err) {
+    return "unreachable";
+  }
+  const data = await readJson(res);
+  if (res.ok) return "claimed";
+
+  const box = $("claim-msg");
+  const btn = $("claim-btn");
+  if (res.status === 409) {
+    if (box) box.innerHTML = `<div class="alert error">该链接已被其他浏览器领取。</div>`;
+    if (btn) { btn.disabled = true; btn.textContent = "无法领取"; }
+  } else if (res.status === 410) {
+    errorPage("链接已失效", data.error || "链接已过期或被撤回。");
+  } else if (box) {
+    if (btn) { btn.disabled = false; btn.textContent = "确认领取"; }
+    box.innerHTML = `<div class="alert error">${esc(data.error || "领取失败")}</div>`;
+  }
+  return "rejected";
+}
+
+function showViewer(state) {
+  stopPolling();
+  setHtml(`
+    <div class="kv">
+      <span>协查服务</span><span class="mono">${esc(state.service)}</span>
+      <span>领取状态</span><span><span class="badge ok">已领取（本浏览器）</span></span>
+      <span>有效至</span><span>${fmtTime(state.expires_at)}</span>
+    </div>
+    <h2>span 列表</h2>
+    <div id="span-box"><span class="spin"></span> <span class="muted">取数中…</span></div>
+    <div class="buttons">
+      <button class="secondary" id="reload-btn">立即刷新</button>
+    </div>
+    <div class="note">仅展示所选服务的 span 名称、耗时与状态；撤回或到期后将无法再取数。</div>
+  `);
+  $("reload-btn").onclick = () => fetchView();
+  fetchView();
+  pollTimer = setInterval(fetchView, 5000);
+}
+
+async function fetchView() {
+  let res;
+  try {
+    res = await fetch(`/i/${encodeURIComponent(linkId)}/view`, { cache: "no-store" });
+  } catch (err) {
+    $("span-box").innerHTML = `<div class="alert warn">网络中断，稍后自动重试…</div>`;
+    return;
+  }
+  const data = await readJson(res);
+  if (res.status === 410) {
+    if (data.error && /revoked|撤回/i.test(data.error)) return errorPage("链接已撤回", "值班员已撤回此协查链接，无法继续取数。");
+    return errorPage("链接已失效", data.error || "链接已过期。");
+  }
+  if (res.status === 401 || res.status === 403) {
+    stopPolling();
+    return errorPage("未领取或凭证失效", data.error || "请重新领取。");
+  }
+  if (!res.ok) {
+    stopPolling();
+    return errorPage("取数失败", data.error || "");
+  }
+  renderSpans(data);
+}
+
+function renderSpans(data) {
+  const spans = data.spans || [];
+  if (!spans.length) {
+    $("span-box").innerHTML = `<div class="note">该服务在留存的链路中没有 span。</div>`;
+    return;
+  }
+  $("span-box").innerHTML = `
+    <table>
+      <thead><tr><th>span 名称</th><th>耗时</th><th>状态</th></tr></thead>
+      <tbody>
+        ${spans.map((s) => `<tr>
+          <td class="mono">${esc(s.name)}</td>
+          <td>${fmtMs(s.duration_ms)}</td>
+          <td><span class="badge ${s.status === "ERROR" ? "err" : "ok"}">${esc(s.status)}</span></td>
+        </tr>`).join("")}
+      </tbody>
+    </table>`;
+}
+
+(async function init() {
+  if (!linkId) return errorPage("链接无效", "缺少协查链接标识。");
+  try { await loadState(); }
+  catch (err) { errorPage("加载失败", String(err)); }
+})();
+</script>
+</body>
+</html>

@@ -333,6 +333,70 @@ class SqliteStore:
             finally:
                 conn.close()
 
+    def retained_services(self, trace_id: str, now: float) -> list[str] | None:
+        """Return the retained services of a trace, or ``None`` if not kept.
+
+        Used to validate that an investigation link targets a service that
+        actually has retained spans.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                with self._tx(conn):
+                    self._settle_conn(conn, now)
+                row = conn.execute(
+                    "SELECT state FROM traces WHERE trace_id = ?", (trace_id,)
+                ).fetchone()
+                if row is None or row["state"] != STATE_KEPT:
+                    return None
+                rows = conn.execute(
+                    "SELECT DISTINCT service FROM spans "
+                    "WHERE trace_id = ? AND service IS NOT NULL AND service != '' "
+                    "ORDER BY service",
+                    (trace_id,),
+                ).fetchall()
+                return [r["service"] for r in rows]
+            finally:
+                conn.close()
+
+    def retained_service_spans(
+        self, trace_id: str, service: str
+    ) -> list[dict[str, Any]] | None:
+        """Return only name/duration/status for one service's retained spans.
+
+        This is the sole data source of the investigation viewer, so no span
+        ids, attributes or raw OTLP body ever leave the internal collector.
+        Returns ``None`` when the trace is not retained.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT state FROM traces WHERE trace_id = ?", (trace_id,)
+                ).fetchone()
+                if row is None or row["state"] != STATE_KEPT:
+                    return None
+                rows = conn.execute(
+                    "SELECT name, duration_ns, is_error FROM spans "
+                    "WHERE trace_id = ? AND service = ? "
+                    "ORDER BY (start_ns IS NULL), start_ns, span_id",
+                    (trace_id, service),
+                ).fetchall()
+                return [
+                    {
+                        "name": r["name"],
+                        "duration_ms": (
+                            r["duration_ns"] / 1_000_000
+                            if r["duration_ns"] is not None
+                            else None
+                        ),
+                        "status": "ERROR" if r["is_error"] else "OK",
+                    }
+                    for r in rows
+                ]
+            finally:
+                conn.close()
+
     def list_traces(
         self, now: float, limit: int = 50, state: str | None = None
     ) -> dict[str, Any]:

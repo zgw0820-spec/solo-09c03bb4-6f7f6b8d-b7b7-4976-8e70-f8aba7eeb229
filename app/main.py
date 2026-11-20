@@ -16,6 +16,8 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .config import Settings
+from .duty import build_duty_router
+from .incidents import IncidentStore
 from .otlp import PayloadError, parse_otlp_json
 from .store import SqliteStore
 
@@ -57,6 +59,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     store = SqliteStore(settings)
     store.init_schema()
+    incidents = IncidentStore(settings)
+    incidents.init_schema()
 
     async def sweep_loop() -> None:
         interval = settings.sweep_interval_seconds
@@ -84,6 +88,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.store = store
+    app.state.incidents = incidents
+    app.include_router(build_duty_router(settings, store, incidents))
 
     @app.exception_handler(PayloadError)
     async def payload_error_handler(request: Request, exc: PayloadError) -> Response:
